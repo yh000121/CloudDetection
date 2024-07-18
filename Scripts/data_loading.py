@@ -1,19 +1,12 @@
-import torch
+import glob
+import os
 import numpy as np
 import xarray as xr
+import torch
 
-def compute_mean_std(tensor):
-    mean = tensor.mean().item()
-    std = tensor.std().item()
-    return mean, std
-
-def standardize(tensor):
-    mean, std = compute_mean_std(tensor)
-    return (tensor - mean) / std
-
-def preprocess_data(ds):
+def preprocess_radiance_data(ds):
     # 提取所有 radiance 图层
-    radiance_layers = [key for key in ds.data_vars.keys() if 'radiance_an' in key]
+    radiance_layers = [key for key in ds.data_vars.keys() if 'radiance_in' in key]
 
     # 获取图像的维度
     rows, cols = ds.sizes['rows'], ds.sizes['columns']
@@ -32,14 +25,21 @@ def preprocess_data(ds):
         # 转换为 PyTorch Tensor
         data_tensor = torch.tensor(data, dtype=torch.float32)
 
+        # 检查并替换 NaN 和 Inf 值
+        if torch.isnan(data_tensor).any() or torch.isinf(data_tensor).any():
+            print(f"Data in layer {layer} contains NaN or Inf values. Replacing with 0.")
+            data_tensor = torch.nan_to_num(data_tensor, nan=0.0, posinf=0.0, neginf=0.0)
+
         # 标准化
-        data_standardized = standardize(data_tensor)
+        data_standardized = (data_tensor - data_tensor.mean()) / data_tensor.std()
+
+        # 归一化
+        data_normalized = (data_standardized - data_standardized.min()) / (data_standardized.max() - data_standardized.min())
 
         # 将标准化后的数据存储到对应的特征位置
-        all_features[:, :, i] = data_standardized.numpy()
+        all_features[:, :, i] = data_normalized.numpy()
 
     return all_features, rows, cols
-
 
 def load_single_label(label_path):
     # 读取标签数据
@@ -51,7 +51,6 @@ def load_single_label(label_path):
 
     return label_data
 
-
 def load_label_data(label_paths, rows, cols):
     # 创建一个空的标签数组，初始值为0
     labels_combined = np.zeros((rows, cols), dtype=int)
@@ -59,6 +58,9 @@ def load_label_data(label_paths, rows, cols):
     for idx, label_path in enumerate(label_paths):
         # 加载单个标签文件
         label_data = load_single_label(label_path)
+
+        # 打印每个标签文件的形状
+        print(f"Label data shape for {label_path}: {label_data.shape}")
 
         # 确认标签数据的形状与预处理数据的形状一致
         if label_data.shape != (rows, cols):
@@ -69,29 +71,46 @@ def load_label_data(label_paths, rows, cols):
 
     return labels_combined
 
-
-# 示例调用
 if __name__ == "__main__":
-    # 定义数据文件路径
-    path = '../images/S1'
+    base_path = '../images'
 
-    # 读取多个 NetCDF 文件并合并到一个 Dataset 中
-    ds = xr.open_mfdataset(f'{path}/S*_radiance_an.nc', combine='by_coords')
+    # 获取所有子目录
+    subdirs = [d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))]
 
-    # 预处理数据
-    all_features, rows, cols = preprocess_data(ds)
+    # 创建文件夹以保存预处理后的数据
+    os.makedirs('processed_data', exist_ok=True)
 
-    # 打印结果以检查
-    print(f"All features shape: {all_features.shape}")
-    print(f"Rows: {rows}, Columns: {cols}")
+    # 创建一个空的列表来存储所有样本的特征和标签
+    all_samples = []
+    all_labels = []
 
+    for subdir in subdirs:
+        subdir_path = os.path.join(base_path, subdir)
+        # 读取多个 NetCDF 文件并合并到一个 Dataset 中
+        ds = xr.open_mfdataset(f'{subdir_path}/S*_radiance_in.nc', combine='by_coords')
 
-    # 加载标签数据
-    label_paths = [
-        '../images/S1/ice_labels.nc',
-        '../images/S1/clear_labels.nc',
-        '../images/S1/cloud_labels.nc'
-    ]
-    label_data = load_label_data(label_paths, rows, cols)
+        # 预处理辐射层数据
+        all_features, rows, cols = preprocess_radiance_data(ds)
+        print(f"All features shape for {subdir}: {all_features.shape}")
 
-    print(f"Combined labels shape: {label_data.shape}")
+        # 增加样本维度并存储到列表
+        all_samples.append(all_features)
+
+        # 检查是否有标签文件
+        label_paths = [os.path.join(subdir_path, label) for label in ['ice_labels.nc', 'clear_labels.nc', 'cloud_labels.nc']]
+        if all(os.path.exists(label_path) for label_path in label_paths):
+            labels = load_label_data(label_paths, rows, cols)
+            all_labels.append(labels)
+
+    # 合并所有样本 (增加一个维度用于区分样本)
+    combined_features = np.stack(all_samples)
+    print(f"Combined features shape: {combined_features.shape}")
+
+    # 保存合并后的辐射层数据
+    np.save("processed_data/preprocessed_data.npy", combined_features)
+
+    if all_labels:
+        # 合并所有标签数据
+        combined_labels = np.stack(all_labels)
+        print(f"Combined labels shape: {combined_labels.shape}")
+        np.save("processed_data/labels.npy", combined_labels)
